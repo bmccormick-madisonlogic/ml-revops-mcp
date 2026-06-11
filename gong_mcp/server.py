@@ -317,20 +317,27 @@ def _get_calls_by_account(client: httpx.Client, args: dict) -> list[TextContent]
 
 def _get_user_by_email(client: httpx.Client, args: dict) -> list[TextContent]:
     email = args["email"].lower().strip()
-    resp = client.get("/users")
-    resp.raise_for_status()
-    users = resp.json().get("users", [])
-    match = next((u for u in users if u.get("emailAddress", "").lower() == email), None)
-    if not match:
-        return [TextContent(type="text", text=f"No Gong user found with email {email}.")]
-    result = {
-        "id": match.get("id"),
-        "name": f"{match.get('firstName', '')} {match.get('lastName', '')}".strip(),
-        "email": match.get("emailAddress"),
-        "title": match.get("title"),
-        "active": match.get("active"),
-    }
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    cursor = None
+    while True:
+        params = {"cursor": cursor} if cursor else {}
+        resp = client.get("/users", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        users = data.get("users", [])
+        match = next((u for u in users if u.get("emailAddress", "").lower() == email), None)
+        if match:
+            result = {
+                "id": match.get("id"),
+                "name": f"{match.get('firstName', '')} {match.get('lastName', '')}".strip(),
+                "email": match.get("emailAddress"),
+                "title": match.get("title"),
+                "active": match.get("active"),
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        cursor = data.get("records", {}).get("cursor")
+        if not cursor:
+            break
+    return [TextContent(type="text", text=f"No Gong user found with email {email}.")]
 
 
 def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
