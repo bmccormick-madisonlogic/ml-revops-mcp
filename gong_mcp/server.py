@@ -117,6 +117,95 @@ async def list_tools() -> list[Tool]:
                 "required": ["crm_account_id"],
             },
         ),
+        Tool(
+            name="get_user_by_email",
+            description=(
+                "Look up a Gong user by their email address. Returns their Gong user ID, "
+                "name, and title. Use this to resolve a rep's email to a Gong ID before "
+                "calling get_calls_by_rep or get_rep_stats."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "Rep's email address, e.g. jsmith@madisonlogic.com",
+                    },
+                },
+                "required": ["email"],
+            },
+        ),
+        Tool(
+            name="get_calls_by_rep",
+            description=(
+                "Get all Gong calls where a specific rep was the primary host, looked up by "
+                "email. Much more efficient than get_calls + scanning parties — resolves the "
+                "rep's Gong user ID then filters server-side. Use for rep-level call reviews."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "Rep's email address",
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Start datetime ISO 8601",
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "End datetime ISO 8601",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max calls to return (default 25)",
+                    },
+                },
+                "required": ["email", "from_date", "to_date"],
+            },
+        ),
+        Tool(
+            name="get_rep_stats",
+            description=(
+                "Get activity stats for a rep over a date range: number of calls, total talk "
+                "time, listening time, and average talk ratio. Useful for coaching briefs and "
+                "manager 1:1s. Looks up the rep by email."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "Rep's email address",
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Start datetime ISO 8601",
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "End datetime ISO 8601",
+                    },
+                },
+                "required": ["email", "from_date", "to_date"],
+            },
+        ),
+        Tool(
+            name="get_call_trackers",
+            description=(
+                "Get tracker hits for a call — competitor mentions, pricing discussions, "
+                "risk signals, objections, and any custom trackers your team has configured. "
+                "Faster than reading the full transcript for deal intelligence."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "call_id": {"type": "string", "description": "Gong call ID"},
+                },
+                "required": ["call_id"],
+            },
+        ),
     ]
 
 
@@ -133,6 +222,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _get_call_details(client, arguments)
         if name == "get_calls_by_account":
             return _get_calls_by_account(client, arguments)
+        if name == "get_user_by_email":
+            return _get_user_by_email(client, arguments)
+        if name == "get_calls_by_rep":
+            return _get_calls_by_rep(client, arguments)
+        if name == "get_rep_stats":
+            return _get_rep_stats(client, arguments)
+        if name == "get_call_trackers":
+            return _get_call_trackers(client, arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -216,6 +313,126 @@ def _get_calls_by_account(client: httpx.Client, args: dict) -> list[TextContent]
         for c in calls
     ]
     return [TextContent(type="text", text=json.dumps(summary, indent=2))]
+
+
+def _get_user_by_email(client: httpx.Client, args: dict) -> list[TextContent]:
+    email = args["email"].lower().strip()
+    resp = client.get("/users")
+    resp.raise_for_status()
+    users = resp.json().get("users", [])
+    match = next((u for u in users if u.get("emailAddress", "").lower() == email), None)
+    if not match:
+        return [TextContent(type="text", text=f"No Gong user found with email {email}.")]
+    result = {
+        "id": match.get("id"),
+        "name": f"{match.get('firstName', '')} {match.get('lastName', '')}".strip(),
+        "email": match.get("emailAddress"),
+        "title": match.get("title"),
+        "active": match.get("active"),
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
+    # Resolve email → Gong user ID
+    user_result = _get_user_by_email(client, {"email": args["email"]})
+    user_text = user_result[0].text
+    if "No Gong user found" in user_text:
+        return user_result
+    user = json.loads(user_text)
+    user_id = user["id"]
+
+    limit = min(int(args.get("limit", 25)), 100)
+    body = {
+        "filter": {
+            "primaryUserId": [user_id],
+            "fromDateTime": args["from_date"],
+            "toDateTime": args["to_date"],
+        }
+    }
+    resp = client.post("/calls/extensive", json=body)
+    resp.raise_for_status()
+    calls = resp.json().get("calls", [])[:limit]
+    summary = [
+        {
+            "id": c.get("metaData", {}).get("id"),
+            "title": c.get("metaData", {}).get("title"),
+            "started": c.get("metaData", {}).get("started"),
+            "duration_seconds": c.get("metaData", {}).get("duration"),
+            "direction": c.get("metaData", {}).get("direction"),
+        }
+        for c in calls
+    ]
+    return [TextContent(type="text", text=json.dumps({"rep": user["name"], "calls": summary}, indent=2))]
+
+
+def _get_rep_stats(client: httpx.Client, args: dict) -> list[TextContent]:
+    # Resolve email → Gong user ID
+    user_result = _get_user_by_email(client, {"email": args["email"]})
+    user_text = user_result[0].text
+    if "No Gong user found" in user_text:
+        return user_result
+    user = json.loads(user_text)
+    user_id = user["id"]
+
+    params = {
+        "fromDateTime": args["from_date"],
+        "toDateTime": args["to_date"],
+        "userIds": user_id,
+    }
+    resp = client.get("/stats/activity/users", params=params)
+    resp.raise_for_status()
+    records = resp.json().get("usersStats", [])
+    if not records:
+        return [TextContent(type="text", text=f"No stats found for {args['email']} in this date range.")]
+    stats = records[0]
+    # Calculate talk ratio if raw times available
+    talk = stats.get("talkingDuration", 0)
+    listen = stats.get("listeningDuration", 0)
+    total = talk + listen
+    talk_ratio = round(talk / total * 100) if total > 0 else None
+    result = {
+        "rep": user["name"],
+        "email": args["email"],
+        "period": {"from": args["from_date"], "to": args["to_date"]},
+        "calls": stats.get("numberOfCalls"),
+        "talk_ratio_pct": talk_ratio,
+        "avg_monologue_seconds": stats.get("avgMonologueDuration"),
+        "avg_customer_engagement": stats.get("avgCustomerEngagement"),
+        "interactivity": stats.get("avgInteractivity"),
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+def _get_call_trackers(client: httpx.Client, args: dict) -> list[TextContent]:
+    body = {
+        "filter": {"callIds": [args["call_id"]]},
+        "contentSelector": {
+            "exposedFields": {
+                "content": {"trackers": True, "topics": True},
+            }
+        },
+    }
+    resp = client.post("/calls/extensive", json=body)
+    resp.raise_for_status()
+    calls = resp.json().get("calls", [])
+    if not calls:
+        return [TextContent(type="text", text="No call found for this ID.")]
+    content = calls[0].get("content", {})
+    trackers = content.get("trackers", [])
+    topics = content.get("topics", [])
+    result = {
+        "call_id": args["call_id"],
+        "trackers": [
+            {"name": t.get("name"), "count": t.get("count"), "phrases": t.get("phrases", [])}
+            for t in trackers
+        ],
+        "topics": [
+            {"name": t.get("name"), "duration_pct": t.get("duration")}
+            for t in topics
+        ],
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 # ── Auth middleware ──────────────────────────────────────────────────────────
