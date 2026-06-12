@@ -57,7 +57,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max calls to return (default 50, max 100)",
+                        "description": "Max calls to return (default 50, max 500). Paginates automatically.",
                     },
                 },
                 "required": ["from_date", "to_date"],
@@ -234,13 +234,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 def _get_calls(client: httpx.Client, args: dict) -> list[TextContent]:
-    limit = min(int(args.get("limit", 50)), 100)
+    limit = min(int(args.get("limit", 50)), 500)
     params = {"fromDateTime": args["from_date"], "toDateTime": args["to_date"]}
-    resp = client.get("/calls", params=params)
-    resp.raise_for_status()
-    data = resp.json()
-    calls = data.get("calls", [])[:limit]
-    # Return only key fields to keep response concise
+    calls = []
+    while len(calls) < limit:
+        resp = client.get("/calls", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        calls.extend(data.get("calls", []))
+        cursor = data.get("records", {}).get("cursor")
+        if not cursor:
+            break
+        params["cursor"] = cursor
     summary = [
         {
             "id": c.get("id"),
@@ -249,7 +254,7 @@ def _get_calls(client: httpx.Client, args: dict) -> list[TextContent]:
             "duration_seconds": c.get("duration"),
             "direction": c.get("direction"),
         }
-        for c in calls
+        for c in calls[:limit]
     ]
     return [TextContent(type="text", text=json.dumps(summary, indent=2))]
 
@@ -300,9 +305,16 @@ def _get_calls_by_account(client: httpx.Client, args: dict) -> list[TextContent]
         body["filter"]["fromDateTime"] = args["from_date"]
     if "to_date" in args:
         body["filter"]["toDateTime"] = args["to_date"]
-    resp = client.post("/calls/extensive", json=body)
-    resp.raise_for_status()
-    calls = resp.json().get("calls", [])
+    calls = []
+    while len(calls) < 500:
+        resp = client.post("/calls/extensive", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        calls.extend(data.get("calls", []))
+        cursor = data.get("records", {}).get("cursor")
+        if not cursor:
+            break
+        body["cursor"] = cursor
     summary = [
         {
             "id": c.get("metaData", {}).get("id"),
@@ -349,7 +361,7 @@ def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
     user = json.loads(user_text)
     user_id = user["id"]
 
-    limit = min(int(args.get("limit", 25)), 100)
+    limit = min(int(args.get("limit", 25)), 500)
     body = {
         "filter": {
             "primaryUserId": [user_id],
@@ -357,9 +369,16 @@ def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
             "toDateTime": args["to_date"],
         }
     }
-    resp = client.post("/calls/extensive", json=body)
-    resp.raise_for_status()
-    calls = resp.json().get("calls", [])[:limit]
+    calls = []
+    while len(calls) < limit:
+        resp = client.post("/calls/extensive", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        calls.extend(data.get("calls", []))
+        cursor = data.get("records", {}).get("cursor")
+        if not cursor:
+            break
+        body["cursor"] = cursor
     summary = [
         {
             "id": c.get("metaData", {}).get("id"),
@@ -368,7 +387,7 @@ def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
             "duration_seconds": c.get("metaData", {}).get("duration"),
             "direction": c.get("metaData", {}).get("direction"),
         }
-        for c in calls
+        for c in calls[:limit]
     ]
     return [TextContent(type="text", text=json.dumps({"rep": user["name"], "calls": summary}, indent=2))]
 
