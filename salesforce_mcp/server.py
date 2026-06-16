@@ -207,23 +207,26 @@ async def list_tools() -> list[Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    client, _ = _client()
-    with client:
-        if name == "search_accounts":
-            return _search_accounts(client, arguments)
-        if name == "get_account":
-            return _get_account(client, arguments)
-        if name == "get_account_opportunities":
-            return _get_account_opportunities(client, arguments)
-        if name == "get_account_contacts":
-            return _get_account_contacts(client, arguments)
-        if name == "get_opportunity":
-            return _get_opportunity(client, arguments)
-        if name == "get_account_activities":
-            return _get_account_activities(client, arguments)
-        if name == "soql_query":
-            return _soql_query(client, arguments)
-    raise ValueError(f"Unknown tool: {name}")
+    try:
+        client, _ = _client()
+        with client:
+            if name == "search_accounts":
+                return _search_accounts(client, arguments)
+            if name == "get_account":
+                return _get_account(client, arguments)
+            if name == "get_account_opportunities":
+                return _get_account_opportunities(client, arguments)
+            if name == "get_account_contacts":
+                return _get_account_contacts(client, arguments)
+            if name == "get_opportunity":
+                return _get_opportunity(client, arguments)
+            if name == "get_account_activities":
+                return _get_account_activities(client, arguments)
+            if name == "soql_query":
+                return _soql_query(client, arguments)
+        raise ValueError(f"Unknown tool: {name}")
+    except Exception as e:
+        return [TextContent(type="text", text=f"Salesforce error: {type(e).__name__}: {str(e)}")]
 
 
 def _search_accounts(client: httpx.Client, args: dict) -> list[TextContent]:
