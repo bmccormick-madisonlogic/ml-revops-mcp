@@ -404,10 +404,8 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 sse = SseServerTransport("/messages/")
 
 
-async def handle_sse(request: Request):
-    async with sse.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
+async def sse_handler(scope, receive, send):
+    async with sse.connect_sse(scope, receive, send) as streams:
         await server.run(
             streams[0],
             streams[1],
@@ -418,7 +416,7 @@ async def handle_sse(request: Request):
 app = Starlette(
     middleware=[Middleware(ApiKeyMiddleware)],
     routes=[
-        Route("/sse", endpoint=handle_sse),
+        Mount("/sse", app=sse_handler),
         Mount("/messages/", app=sse.handle_post_message),
         Route("/health", endpoint=lambda r: Response("ok")),
     ],
