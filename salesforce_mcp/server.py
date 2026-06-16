@@ -10,7 +10,6 @@ from mcp.types import TextContent, Tool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount, Route
@@ -417,15 +416,7 @@ async def handle_sse(request: Request):
 
 
 app = Starlette(
-    middleware=[
-        Middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-        ),
-        Middleware(ApiKeyMiddleware),
-    ],
+    middleware=[Middleware(ApiKeyMiddleware)],
     routes=[
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse.handle_post_message),
