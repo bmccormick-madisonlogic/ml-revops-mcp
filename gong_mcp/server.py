@@ -206,6 +206,29 @@ async def list_tools() -> list[Tool]:
                 "required": ["call_id"],
             },
         ),
+        Tool(
+            name="get_account_call_summary",
+            description=(
+                "Get a synthesized summary of the last N Gong calls for a Salesforce account. "
+                "For each call returns: date, duration, external participants, Gong AI brief, "
+                "key points, topics discussed, and tracker hits (competitor mentions, objections, etc.). "
+                "Use this for meeting prep and account reviews — much faster than pulling individual transcripts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "crm_account_id": {
+                        "type": "string",
+                        "description": "Salesforce account ID (18-char)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of recent calls to summarize (default 3, max 5)",
+                    },
+                },
+                "required": ["crm_account_id"],
+            },
+        ),
     ]
 
 
@@ -230,6 +253,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return _get_rep_stats(client, arguments)
         if name == "get_call_trackers":
             return _get_call_trackers(client, arguments)
+        if name == "get_account_call_summary":
+            return _get_account_call_summary(client, arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -457,6 +482,70 @@ def _get_call_trackers(client: httpx.Client, args: dict) -> list[TextContent]:
             {"name": t.get("name"), "duration_pct": t.get("duration")}
             for t in topics
         ],
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+def _get_account_call_summary(client: httpx.Client, args: dict) -> list[TextContent]:
+    limit = min(int(args.get("limit", 3)), 5)
+    body = {
+        "filter": {"crmAccountIds": [args["crm_account_id"]]},
+        "contentSelector": {
+            "exposedFields": {
+                "parties": True,
+                "content": {
+                    "brief": True,
+                    "keyPoints": True,
+                    "trackers": True,
+                    "topics": True,
+                },
+            }
+        },
+    }
+    resp = client.post("/calls/extensive", json=body)
+    resp.raise_for_status()
+    calls = resp.json().get("calls", [])
+
+    calls_sorted = sorted(
+        calls,
+        key=lambda c: c.get("metaData", {}).get("started", ""),
+        reverse=True,
+    )[:limit]
+
+    summaries = []
+    for c in calls_sorted:
+        meta = c.get("metaData", {})
+        content = c.get("content", {})
+        parties = c.get("parties", [])
+
+        external = [
+            p.get("name") for p in parties
+            if p.get("affiliation") == "External" and p.get("name")
+        ]
+
+        summaries.append({
+            "call_id": meta.get("id"),
+            "title": meta.get("title"),
+            "date": meta.get("started"),
+            "duration_minutes": round((meta.get("duration") or 0) / 60),
+            "external_participants": external,
+            "brief": content.get("brief"),
+            "key_points": content.get("keyPoints", []),
+            "topics": [
+                {"name": t.get("name"), "duration_pct": t.get("duration")}
+                for t in content.get("topics", [])
+            ],
+            "tracker_hits": [
+                {"tracker": t.get("name"), "count": t.get("count")}
+                for t in content.get("trackers", [])
+                if (t.get("count") or 0) > 0
+            ],
+        })
+
+    result = {
+        "account_id": args["crm_account_id"],
+        "calls_summarized": len(summaries),
+        "calls": summaries,
     }
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
