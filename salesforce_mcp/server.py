@@ -454,7 +454,7 @@ def _get_pipeline_summary(client: httpx.Client, args: dict) -> list[TextContent]
             date_filter = ""
 
     query = (
-        f"SELECT Id, Name, StageName, Amount, CloseDate, LastActivityDate, "
+        f"SELECT Id, Name, AccountId, StageName, Amount, CloseDate, LastActivityDate, "
         f"Owner.Name, Account.Name "
         f"FROM Opportunity WHERE IsClosed = false {date_filter} "
         f"ORDER BY CloseDate ASC LIMIT 500"
@@ -495,6 +495,7 @@ def _get_pipeline_summary(client: httpx.Client, args: dict) -> list[TextContent]
                 at_risk.append({
                     "id": r.get("Id"),
                     "name": r.get("Name"),
+                    "account_id": r.get("AccountId"),
                     "account": (r.get("Account") or {}).get("Name"),
                     "stage": stage,
                     "amount": amount,
