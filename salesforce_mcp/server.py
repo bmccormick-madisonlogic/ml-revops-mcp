@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import date, timedelta
 
 import httpx
 import uvicorn
@@ -195,6 +196,57 @@ async def list_tools() -> list[Tool]:
                 "required": ["query"],
             },
         ),
+        Tool(
+            name="get_pipeline_summary",
+            description=(
+                "Summarize the open sales pipeline across the org. Returns total amount and deal count, "
+                "breakdown by stage (count + $), breakdown by rep/owner (count + $, sorted by amount), "
+                "and a list of at-risk deals (closing within 45 days with no activity in 30+ days). "
+                "Use for forecast calls, pipeline reviews, and executive summaries."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "enum": ["this_quarter", "next_quarter", "all"],
+                        "description": "Filter by close date period. Default: this_quarter.",
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Custom range start date (YYYY-MM-DD). Only used if period is omitted.",
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "Custom range end date (YYYY-MM-DD). Only used if period is omitted.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_rep_pipeline",
+            description=(
+                "Get all open opportunities for a specific sales rep by name. Returns each deal's "
+                "account, stage, amount, close date, last activity date, and next step. "
+                "Useful for rep-level pipeline reviews and 1:1 prep."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "owner_name": {
+                        "type": "string",
+                        "description": "Rep's name or partial name, e.g. 'Sarah' or 'Smith'.",
+                    },
+                    "period": {
+                        "type": "string",
+                        "enum": ["this_quarter", "next_quarter", "all"],
+                        "description": "Filter by close date period. Default: all.",
+                    },
+                },
+                "required": ["owner_name"],
+            },
+        ),
     ]
 
 
@@ -219,6 +271,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return _get_account_activities(client, arguments)
             if name == "soql_query":
                 return _soql_query(client, arguments)
+            if name == "get_pipeline_summary":
+                return _get_pipeline_summary(client, arguments)
+            if name == "get_rep_pipeline":
+                return _get_rep_pipeline(client, arguments)
         raise ValueError(f"Unknown tool: {name}")
     except Exception as e:
         return [TextContent(type="text", text=f"Salesforce error: {type(e).__name__}: {str(e)}")]
@@ -381,6 +437,130 @@ def _get_account_activities(client: httpx.Client, args: dict) -> list[TextConten
 def _soql_query(client: httpx.Client, args: dict) -> list[TextContent]:
     records = _soql(client, args["query"])
     return [TextContent(type="text", text=json.dumps(records, indent=2))]
+
+
+def _get_pipeline_summary(client: httpx.Client, args: dict) -> list[TextContent]:
+    period = args.get("period", "this_quarter")
+    if period == "this_quarter":
+        date_filter = "AND CloseDate = THIS_QUARTER"
+    elif period == "next_quarter":
+        date_filter = "AND CloseDate = NEXT_QUARTER"
+    else:
+        start = args.get("start_date")
+        end = args.get("end_date")
+        if start and end:
+            date_filter = f"AND CloseDate >= {start} AND CloseDate <= {end}"
+        else:
+            date_filter = ""
+
+    query = (
+        f"SELECT Id, Name, StageName, Amount, CloseDate, LastActivityDate, "
+        f"Owner.Name, Account.Name "
+        f"FROM Opportunity WHERE IsClosed = false {date_filter} "
+        f"ORDER BY CloseDate ASC LIMIT 500"
+    )
+    records = _soql(client, query)
+
+    today = date.today()
+    stale_cutoff = today - timedelta(days=30)
+    at_risk_cutoff = today + timedelta(days=45)
+
+    by_stage = {}
+    by_owner = {}
+    at_risk = []
+    total_amount = 0
+
+    for r in records:
+        stage = r.get("StageName") or "Unknown"
+        owner = (r.get("Owner") or {}).get("Name") or "Unknown"
+        amount = r.get("Amount") or 0
+        close_date_str = r.get("CloseDate")
+        last_activity_str = r.get("LastActivityDate")
+
+        by_stage.setdefault(stage, {"count": 0, "amount": 0})
+        by_stage[stage]["count"] += 1
+        by_stage[stage]["amount"] += amount
+
+        by_owner.setdefault(owner, {"count": 0, "amount": 0})
+        by_owner[owner]["count"] += 1
+        by_owner[owner]["amount"] += amount
+
+        total_amount += amount
+
+        if close_date_str:
+            close_date = date.fromisoformat(close_date_str)
+            last_activity = date.fromisoformat(last_activity_str) if last_activity_str else None
+            is_stale = last_activity is None or last_activity < stale_cutoff
+            if close_date <= at_risk_cutoff and is_stale:
+                at_risk.append({
+                    "id": r.get("Id"),
+                    "name": r.get("Name"),
+                    "account": (r.get("Account") or {}).get("Name"),
+                    "stage": stage,
+                    "amount": amount,
+                    "close_date": close_date_str,
+                    "last_activity": last_activity_str,
+                    "owner": owner,
+                })
+
+    by_owner_sorted = dict(
+        sorted(by_owner.items(), key=lambda x: x[1]["amount"], reverse=True)
+    )
+
+    result = {
+        "period": period,
+        "total_opportunities": len(records),
+        "total_amount": total_amount,
+        "by_stage": by_stage,
+        "by_owner": by_owner_sorted,
+        "at_risk": at_risk[:10],
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+def _get_rep_pipeline(client: httpx.Client, args: dict) -> list[TextContent]:
+    owner_name = args["owner_name"].replace("'", "\\'")
+    period = args.get("period", "all")
+    if period == "this_quarter":
+        date_filter = "AND CloseDate = THIS_QUARTER"
+    elif period == "next_quarter":
+        date_filter = "AND CloseDate = NEXT_QUARTER"
+    else:
+        date_filter = ""
+
+    query = (
+        f"SELECT Id, Name, Account.Name, StageName, Amount, CloseDate, "
+        f"LastActivityDate, NextStep, Type "
+        f"FROM Opportunity "
+        f"WHERE Owner.Name LIKE '%{owner_name}%' AND IsClosed = false {date_filter} "
+        f"ORDER BY CloseDate ASC LIMIT 100"
+    )
+    records = _soql(client, query)
+
+    total_amount = sum(r.get("Amount") or 0 for r in records)
+    cleaned = [
+        {
+            "id": r.get("Id"),
+            "name": r.get("Name"),
+            "account": (r.get("Account") or {}).get("Name"),
+            "stage": r.get("StageName"),
+            "amount": r.get("Amount"),
+            "close_date": r.get("CloseDate"),
+            "last_activity": r.get("LastActivityDate"),
+            "next_step": r.get("NextStep"),
+            "type": r.get("Type"),
+        }
+        for r in records
+    ]
+
+    result = {
+        "rep": owner_name,
+        "period": period,
+        "total_opportunities": len(records),
+        "total_amount": total_amount,
+        "opportunities": cleaned,
+    }
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 # ── SSE transport + app ───────────────────────────────────────────────────────
