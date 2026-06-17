@@ -569,7 +569,7 @@ def _get_rep_pipeline(client: httpx.Client, args: dict) -> list[TextContent]:
 sse = SseServerTransport("/messages/")
 
 
-async def app(scope, receive, send):
+async def _asgi_app(scope, receive, send):
     if scope["type"] != "http":
         return
     path = scope["path"]
@@ -577,6 +577,47 @@ async def app(scope, receive, send):
     if path == "/health":
         await Response("ok")(scope, receive, send)
     elif path in ("/sse", "/sse/"):
+        if method == "GET":
+            async with sse.connect_sse(scope, receive, send) as streams:
+                await server.run(
+                    streams[0],
+                    streams[1],
+                    server.create_initialization_options(),
+                )
+        else:
+            await Response(status_code=405)(scope, receive, send)
+    elif path.startswith("/messages/"):
+        await sse.handle_post_message(scope, receive, send)
+    else:
+        await Response(status_code=404)(scope, receive, send)
+
+
+def _check_api_key(scope: dict) -> bool:
+    api_key = os.getenv("MCP_API_KEY")
+    if not api_key:
+        return True
+    headers = {k.lower(): v for k, v in scope.get("headers", [])}
+    provided = headers.get(b"x-api-key", b"").decode()
+    if not provided:
+        qs = scope.get("query_string", b"").decode()
+        for part in qs.split("&"):
+            if part.startswith("api_key="):
+                provided = part[8:]
+    return provided == api_key
+
+
+async def app(scope, receive, send):
+    if scope["type"] != "http":
+        return
+    path = scope["path"]
+    method = scope["method"]
+    if path == "/health":
+        await Response("ok")(scope, receive, send)
+        return
+    if not _check_api_key(scope):
+        await Response("Unauthorized", status_code=401)(scope, receive, send)
+        return
+    if path in ("/sse", "/sse/"):
         if method == "GET":
             async with sse.connect_sse(scope, receive, send) as streams:
                 await server.run(
