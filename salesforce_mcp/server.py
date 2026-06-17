@@ -30,6 +30,8 @@ def _get_access_token() -> tuple[str, str]:
         },
         timeout=15,
     )
+    if resp.status_code != 200:
+        print(f"SF AUTH FAILED {resp.status_code}: {resp.text}", flush=True)
     resp.raise_for_status()
     data = resp.json()
     return data["access_token"], data["instance_url"]
