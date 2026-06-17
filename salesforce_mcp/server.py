@@ -30,8 +30,6 @@ def _get_access_token() -> tuple[str, str]:
         },
         timeout=15,
     )
-    if resp.status_code != 200:
-        print(f"SF AUTH FAILED {resp.status_code}: {resp.text}", flush=True)
     resp.raise_for_status()
     data = resp.json()
     return data["access_token"], data["instance_url"]
@@ -570,28 +568,6 @@ def _get_rep_pipeline(client: httpx.Client, args: dict) -> list[TextContent]:
 
 sse = SseServerTransport("/messages/")
 
-
-async def _asgi_app(scope, receive, send):
-    if scope["type"] != "http":
-        return
-    path = scope["path"]
-    method = scope["method"]
-    if path == "/health":
-        await Response("ok")(scope, receive, send)
-    elif path in ("/sse", "/sse/"):
-        if method == "GET":
-            async with sse.connect_sse(scope, receive, send) as streams:
-                await server.run(
-                    streams[0],
-                    streams[1],
-                    server.create_initialization_options(),
-                )
-        else:
-            await Response(status_code=405)(scope, receive, send)
-    elif path.startswith("/messages/"):
-        await sse.handle_post_message(scope, receive, send)
-    else:
-        await Response(status_code=404)(scope, receive, send)
 
 
 def _check_api_key(scope: dict) -> bool:
