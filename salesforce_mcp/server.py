@@ -8,8 +8,12 @@ from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.routing import Mount, Route
 
 load_dotenv()
 
@@ -564,52 +568,45 @@ def _get_rep_pipeline(client: httpx.Client, args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
+# ── Auth middleware ───────────────────────────────────────────────────────────
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # /messages/ uses session_id auth (MCP protocol); /health is public
+        if request.url.path.startswith("/messages/") or request.url.path == "/health":
+            return await call_next(request)
+        api_key = os.getenv("MCP_API_KEY")
+        if api_key:
+            provided = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+            if provided != api_key:
+                return Response("Unauthorized", status_code=401)
+        return await call_next(request)
+
+
 # ── SSE transport + app ───────────────────────────────────────────────────────
 
 sse = SseServerTransport("/messages/")
 
 
-
-def _check_api_key(scope: dict) -> bool:
-    api_key = os.getenv("MCP_API_KEY")
-    if not api_key:
-        return True
-    headers = {k.lower(): v for k, v in scope.get("headers", [])}
-    provided = headers.get(b"x-api-key", b"").decode()
-    if not provided:
-        qs = scope.get("query_string", b"").decode()
-        for part in qs.split("&"):
-            if part.startswith("api_key="):
-                provided = part[8:]
-    return provided == api_key
+async def handle_sse(request: Request):
+    async with sse.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await server.run(
+            streams[0],
+            streams[1],
+            server.create_initialization_options(),
+        )
 
 
-async def app(scope, receive, send):
-    if scope["type"] != "http":
-        return
-    path = scope["path"]
-    method = scope["method"]
-    if path == "/health":
-        await Response("ok")(scope, receive, send)
-        return
-    if not path.startswith("/messages/") and not _check_api_key(scope):
-        await Response("Unauthorized", status_code=401)(scope, receive, send)
-        return
-    if path in ("/sse", "/sse/"):
-        if method == "GET":
-            async with sse.connect_sse(scope, receive, send) as streams:
-                await server.run(
-                    streams[0],
-                    streams[1],
-                    server.create_initialization_options(),
-                )
-        else:
-            await Response(status_code=405)(scope, receive, send)
-    elif path.startswith("/messages/"):
-        await sse.handle_post_message(scope, receive, send)
-    else:
-        await Response(status_code=404)(scope, receive, send)
-
+app = Starlette(
+    middleware=[Middleware(ApiKeyMiddleware)],
+    routes=[
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+        Route("/health", endpoint=lambda r: Response("ok")),
+    ],
+)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8002))
