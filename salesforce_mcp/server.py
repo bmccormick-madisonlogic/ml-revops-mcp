@@ -592,7 +592,7 @@ async def app(scope, receive, send):
     if path == "/health":
         await Response("ok")(scope, receive, send)
         return
-    if not _check_api_key(scope):
+    if not path.startswith("/messages/") and not _check_api_key(scope):
         await Response("Unauthorized", status_code=401)(scope, receive, send)
         return
     if path in ("/sse", "/sse/"):
