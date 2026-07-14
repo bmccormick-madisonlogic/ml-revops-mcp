@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import uvicorn
@@ -96,7 +97,13 @@ async def list_tools() -> list[Tool]:
             name="get_calls_by_account",
             description=(
                 "Get all Gong calls linked to a Salesforce account ID. Returns calls in "
-                "reverse chronological order. Useful for account research and deal reviews."
+                "reverse chronological order. Useful for account research and deal reviews. "
+                "Searches the last 90 days by default; pass from_date/to_date to widen the "
+                "search if no calls are found. IMPORTANT: for dormant/inactive/churned "
+                "accounts, win-back or reactivation research, or any query where the account "
+                "may not have recent activity by definition, set from_date back 1-2+ years "
+                "from the start — the 90-day default will look empty for exactly these accounts, "
+                "which is a search-scope artifact, not evidence of no Gong history."
             ),
             inputSchema={
                 "type": "object",
@@ -140,7 +147,11 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Get all Gong calls where a specific rep was the primary host, looked up by "
                 "email. Much more efficient than get_calls + scanning parties — resolves the "
-                "rep's Gong user ID then filters server-side. Use for rep-level call reviews."
+                "rep's Gong user ID then filters server-side. Use for rep-level call reviews. "
+                "IMPORTANT: the response includes a `truncated` field. If `truncated` is true, "
+                "you have NOT seen the full date range — do not answer the user's question yet. "
+                "Re-call this tool with `from_date` set to the `next_from_date` value given in "
+                "the response and keep going until `truncated` is false, THEN answer."
             ),
             inputSchema={
                 "type": "object",
@@ -159,7 +170,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max calls to return (default 25)",
+                        "description": "Max calls to return in this page (default 200, max 3000)",
                     },
                 },
                 "required": ["email", "from_date", "to_date"],
@@ -212,7 +223,13 @@ async def list_tools() -> list[Tool]:
                 "Get a synthesized summary of the last N Gong calls for a Salesforce account. "
                 "For each call returns: date, duration, external participants, Gong AI brief, "
                 "key points, topics discussed, and tracker hits (competitor mentions, objections, etc.). "
-                "Use this for meeting prep and account reviews — much faster than pulling individual transcripts."
+                "Use this for meeting prep and account reviews — much faster than pulling individual transcripts. "
+                "Searches the last 90 days by default; pass from_date/to_date to widen the search "
+                "if no calls are found. IMPORTANT: for dormant/inactive/churned accounts, win-back "
+                "or reactivation research, or any query where the account may not have recent "
+                "activity by definition, set from_date back 1-2+ years from the start — the 90-day "
+                "default will look empty for exactly these accounts, which is a search-scope "
+                "artifact, not evidence of no Gong history."
             ),
             inputSchema={
                 "type": "object",
@@ -224,6 +241,14 @@ async def list_tools() -> list[Tool]:
                     "limit": {
                         "type": "integer",
                         "description": "Number of recent calls to summarize (default 3, max 5)",
+                    },
+                    "from_date": {
+                        "type": "string",
+                        "description": "Optional start datetime ISO 8601. Defaults to 90 days ago.",
+                    },
+                    "to_date": {
+                        "type": "string",
+                        "description": "Optional end datetime ISO 8601. Defaults to now.",
                     },
                 },
                 "required": ["crm_account_id"],
@@ -324,32 +349,79 @@ def _get_call_details(client: httpx.Client, args: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(calls[0], indent=2))]
 
 
+def _call_matches_account(call: dict, crm_account_id: str) -> bool:
+    # The CRM Account/Opportunity link lives on the call's own "context" field,
+    # not on parties[].context (which only links parties to Salesforce Users).
+    for ctx in call.get("context", []):
+        for obj in ctx.get("objects", []):
+            if obj.get("objectType") == "Account" and obj.get("objectId") == crm_account_id:
+                return True
+    return False
+
+
 def _get_calls_by_account(client: httpx.Client, args: dict) -> list[TextContent]:
-    body: dict = {"filter": {"crmAccountIds": [args["crm_account_id"]]}}
-    if "from_date" in args:
-        body["filter"]["fromDateTime"] = args["from_date"]
+    # Gong's /calls/extensive filter has no crmAccountIds field (per Gong API docs),
+    # so it's ignored server-side and every account query returned the same unfiltered
+    # list. Account matching has to happen client-side against each call's own CRM
+    # context (call.context[], not parties[].context, which only links to SF Users).
+    crm_account_id = args["crm_account_id"]
+    from_date = args.get(
+        "from_date", (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    body: dict = {
+        "filter": {"fromDateTime": from_date},
+        "contentSelector": {
+            "context": "Extended",
+            "exposedFields": {"parties": True},
+        },
+    }
     if "to_date" in args:
         body["filter"]["toDateTime"] = args["to_date"]
-    calls = []
-    while len(calls) < 500:
+
+    matched = []
+    scanned = 0
+    scan_limit = 5000
+    truncated = False
+    while True:
         resp = client.post("/calls/extensive", json=body)
         resp.raise_for_status()
         data = resp.json()
-        calls.extend(data.get("calls", []))
+        page = data.get("calls", [])
+        scanned += len(page)
+        matched.extend(c for c in page if _call_matches_account(c, crm_account_id))
         cursor = data.get("records", {}).get("cursor")
         if not cursor:
             break
+        if scanned >= scan_limit:
+            truncated = True
+            break
         body["cursor"] = cursor
-    summary = [
-        {
-            "id": c.get("metaData", {}).get("id"),
-            "title": c.get("metaData", {}).get("title"),
-            "started": c.get("metaData", {}).get("started"),
-            "duration_seconds": c.get("metaData", {}).get("duration"),
-        }
-        for c in calls
-    ]
-    return [TextContent(type="text", text=json.dumps(summary, indent=2))]
+
+    matched.sort(key=lambda c: c.get("metaData", {}).get("started", ""), reverse=True)
+    result = {
+        "date_range_scanned": {
+            "from": from_date,
+            "to": args.get("to_date", "now"),
+            "note": "Defaults to the last 90 days; pass from_date/to_date to widen or narrow this.",
+        },
+        "call_count": len(matched),
+        "calls": [
+            {
+                "id": c.get("metaData", {}).get("id"),
+                "title": c.get("metaData", {}).get("title"),
+                "started": c.get("metaData", {}).get("started"),
+                "duration_seconds": c.get("metaData", {}).get("duration"),
+            }
+            for c in matched
+        ],
+    }
+    if truncated:
+        result["truncated"] = True
+        result["note"] = (
+            f"Scan stopped after {scanned} calls in range without reaching the end of the "
+            "window; results may be incomplete. Narrow with from_date/to_date to see all matches."
+        )
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 def _get_user_by_email(client: httpx.Client, args: dict) -> list[TextContent]:
@@ -386,7 +458,7 @@ def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
     user = json.loads(user_text)
     user_id = user["id"]
 
-    limit = min(int(args.get("limit", 25)), 500)
+    limit = min(int(args.get("limit", 200)), 3000)
     body = {
         "filter": {
             "primaryUserId": [user_id],
@@ -395,15 +467,21 @@ def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
         }
     }
     calls = []
-    while len(calls) < limit:
+    truncated = False
+    while True:
         resp = client.post("/calls/extensive", json=body)
         resp.raise_for_status()
         data = resp.json()
         calls.extend(data.get("calls", []))
         cursor = data.get("records", {}).get("cursor")
+        if len(calls) >= limit:
+            truncated = bool(cursor)
+            break
         if not cursor:
             break
         body["cursor"] = cursor
+
+    calls = calls[:limit]
     summary = [
         {
             "id": c.get("metaData", {}).get("id"),
@@ -412,9 +490,26 @@ def _get_calls_by_rep(client: httpx.Client, args: dict) -> list[TextContent]:
             "duration_seconds": c.get("metaData", {}).get("duration"),
             "direction": c.get("metaData", {}).get("direction"),
         }
-        for c in calls[:limit]
+        for c in calls
     ]
-    return [TextContent(type="text", text=json.dumps({"rep": user["name"], "calls": summary}, indent=2))]
+
+    result = {
+        "rep": user["name"],
+        "period_requested": {"from": args["from_date"], "to": args["to_date"]},
+        "calls_returned": len(summary),
+        "truncated": truncated,
+        "calls": summary,
+    }
+    if truncated:
+        last_started = summary[-1]["started"] if summary else args["from_date"]
+        result["next_from_date"] = last_started
+        result["note"] = (
+            f"Hit the {limit}-call page limit before reaching {args['to_date']}. "
+            f"Only calls through {last_started} are included. This range has NOT been "
+            f"fully covered — call get_calls_by_rep again with from_date="
+            f"'{last_started}' (and the same to_date) to get the rest before answering."
+        )
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 def _get_rep_stats(client: httpx.Client, args: dict) -> list[TextContent]:
@@ -487,10 +582,18 @@ def _get_call_trackers(client: httpx.Client, args: dict) -> list[TextContent]:
 
 
 def _get_account_call_summary(client: httpx.Client, args: dict) -> list[TextContent]:
+    # Same client-side CRM matching as _get_calls_by_account (no server-side account
+    # filter exists). Scans the full window before sorting so "most recent N" is
+    # accurate rather than just the first N matches encountered during pagination.
     limit = min(int(args.get("limit", 3)), 5)
+    crm_account_id = args["crm_account_id"]
+    from_date = args.get(
+        "from_date", (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
     body = {
-        "filter": {"crmAccountIds": [args["crm_account_id"]]},
+        "filter": {"fromDateTime": from_date},
         "contentSelector": {
+            "context": "Extended",
             "exposedFields": {
                 "parties": True,
                 "content": {
@@ -499,12 +602,29 @@ def _get_account_call_summary(client: httpx.Client, args: dict) -> list[TextCont
                     "trackers": True,
                     "topics": True,
                 },
-            }
+            },
         },
     }
-    resp = client.post("/calls/extensive", json=body)
-    resp.raise_for_status()
-    calls = resp.json().get("calls", [])
+    if "to_date" in args:
+        body["filter"]["toDateTime"] = args["to_date"]
+    calls = []
+    scanned = 0
+    scan_limit = 5000
+    truncated = False
+    while True:
+        resp = client.post("/calls/extensive", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        page = data.get("calls", [])
+        scanned += len(page)
+        calls.extend(c for c in page if _call_matches_account(c, crm_account_id))
+        cursor = data.get("records", {}).get("cursor")
+        if not cursor:
+            break
+        if scanned >= scan_limit:
+            truncated = True
+            break
+        body["cursor"] = cursor
 
     calls_sorted = sorted(
         calls,
@@ -544,9 +664,19 @@ def _get_account_call_summary(client: httpx.Client, args: dict) -> list[TextCont
 
     result = {
         "account_id": args["crm_account_id"],
+        "date_range_scanned": {
+            "from": from_date,
+            "to": args.get("to_date", "now"),
+            "note": "Defaults to the last 90 days; pass from_date/to_date to widen or narrow this.",
+        },
         "calls_summarized": len(summaries),
         "calls": summaries,
     }
+    if truncated:
+        result["note"] = (
+            f"Scan stopped after {scanned} calls in range without reaching the end; "
+            "there may be more recent matching calls. Narrow with from_date/to_date if needed."
+        )
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
