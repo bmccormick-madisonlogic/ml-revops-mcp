@@ -597,6 +597,9 @@ async def handle_sse(request: Request):
             streams[1],
             server.create_initialization_options(),
         )
+    # Newer Starlette treats the endpoint's return value as an ASGI response and
+    # calls it; returning None crashes with "'NoneType' object is not callable".
+    return Response()
 
 
 app = Starlette(
