@@ -572,10 +572,12 @@ def _get_rep_pipeline(client: httpx.Client, args: dict) -> list[TextContent]:
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
-# Paths that must stay public: MCP protocol (/sse, /messages/), health, and the
-# OAuth-shim handshake endpoints below.
+# Paths that must stay public: MCP protocol (/messages/), health, and the
+# OAuth-shim handshake endpoints below. NOTE: /sse is intentionally NOT here — if
+# MCP_API_KEY is set, /sse stays gated by the key (Claude passes it via the
+# connector URL's ?api_key=). If no key is set, /sse is open regardless.
 _PUBLIC_PREFIXES = (
-    "/messages/", "/health", "/sse",
+    "/messages/", "/health",
     "/.well-known/", "/register", "/authorize", "/token",
 )
 
