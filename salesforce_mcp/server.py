@@ -586,7 +586,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         if not any(path == p or path.startswith(p) for p in _PUBLIC_PREFIXES):
-            api_key = os.getenv("MCP_API_KEY")
+            api_key = os.getenv("API_KEY") or os.getenv("MCP_API_KEY")
             if api_key:
                 provided = request.headers.get("X-API-Key") or request.query_params.get("api_key")
                 if provided != api_key:
