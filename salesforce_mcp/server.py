@@ -1,6 +1,8 @@
 import json
 import os
+import time
 from datetime import date, timedelta
+from urllib.parse import urlencode
 
 import httpx
 import uvicorn
@@ -12,7 +14,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 
 load_dotenv()
@@ -570,17 +572,93 @@ def _get_rep_pipeline(client: httpx.Client, args: dict) -> list[TextContent]:
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
 
+# Paths that must stay public: MCP protocol (/sse, /messages/), health, and the
+# OAuth-shim handshake endpoints below.
+_PUBLIC_PREFIXES = (
+    "/messages/", "/health", "/sse",
+    "/.well-known/", "/register", "/authorize", "/token",
+)
+
+
 class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # /messages/ uses session_id auth (MCP protocol); /health is public
-        if request.url.path.startswith("/messages/") or request.url.path == "/health":
-            return await call_next(request)
-        api_key = os.getenv("MCP_API_KEY")
-        if api_key:
-            provided = request.headers.get("X-API-Key") or request.query_params.get("api_key")
-            if provided != api_key:
-                return Response("Unauthorized", status_code=401)
+        path = request.url.path
+        if not any(path == p or path.startswith(p) for p in _PUBLIC_PREFIXES):
+            api_key = os.getenv("MCP_API_KEY")
+            if api_key:
+                provided = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+                if provided != api_key:
+                    return Response("Unauthorized", status_code=401)
         return await call_next(request)
+
+
+# ── OAuth shim (CLOSED PILOT ONLY) ────────────────────────────────────────────
+# Claude's connector requires an OAuth handshake before it will connect to a
+# remote MCP. These endpoints satisfy that handshake with NO real authentication
+# — everyone is granted access. This is no less secure than the endpoint already
+# is (fully open). REPLACE with real IdP-backed OAuth before opening beyond the
+# closed pilot.
+
+def _public_base(request: Request) -> str:
+    # Advertise the public https URL (respect Railway's proxy headers).
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    return f"{proto}://{host}"
+
+
+async def oauth_protected_resource(request: Request):
+    base = _public_base(request)
+    return JSONResponse({"resource": base, "authorization_servers": [base]})
+
+
+async def oauth_authorization_server(request: Request):
+    base = _public_base(request)
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
+async def oauth_register(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return JSONResponse({
+        "client_id": "pilot-client",
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": body.get("redirect_uris", []),
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    }, status_code=201)
+
+
+async def oauth_authorize(request: Request):
+    p = request.query_params
+    redirect_uri = p.get("redirect_uri")
+    if not redirect_uri:
+        return Response("missing redirect_uri", status_code=400)
+    q = {"code": "pilot-code"}
+    if p.get("state") is not None:
+        q["state"] = p["state"]
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{sep}{urlencode(q)}", status_code=302)
+
+
+async def oauth_token(request: Request):
+    return JSONResponse({
+        "access_token": "pilot-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "mcp",
+    })
 
 
 # ── SSE transport + app ───────────────────────────────────────────────────────
@@ -608,6 +686,14 @@ app = Starlette(
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse.handle_post_message),
         Route("/health", endpoint=lambda r: Response("ok")),
+        # OAuth shim (closed pilot only)
+        Route("/.well-known/oauth-protected-resource", endpoint=oauth_protected_resource),
+        Route("/.well-known/oauth-protected-resource/sse", endpoint=oauth_protected_resource),
+        Route("/.well-known/oauth-authorization-server", endpoint=oauth_authorization_server),
+        Route("/.well-known/oauth-authorization-server/sse", endpoint=oauth_authorization_server),
+        Route("/register", endpoint=oauth_register, methods=["POST"]),
+        Route("/authorize", endpoint=oauth_authorize, methods=["GET"]),
+        Route("/token", endpoint=oauth_token, methods=["POST"]),
     ],
 )
 
